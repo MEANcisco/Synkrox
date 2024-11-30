@@ -1,0 +1,280 @@
+package main
+
+import (
+	"bytes"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"mime/multipart"
+	"net/http"
+	"os"
+	"path/filepath"
+	"time"
+
+	_ "github.com/mattn/go-sqlite3"
+	_ "github.com/nakagami/firebirdsql"
+)
+
+const (
+	dbHost       = "10.211.55.3"
+	dbPort       = "3050"
+	dbName       = "C:\\\\GesWinFB\\\\DATOS001.GDB"
+	dbUser       = "SYSDBA"
+	dbPassword   = "masterkey"
+	sqliteDBPath = "sync_status.db"
+)
+
+type Product struct {
+	CODIGO_PRODUCTO  string   `json:"CODIGO_PRODUCTO"`
+	NOMBRE_PRODUCTO  string   `json:"NOMBRE_PRODUCTO"`
+	PREVTA1_PRODUCTO float64  `json:"PREVTA1_PRODUCTO"`
+	AUTOR            string   `json:"AUTOR"`
+	FOTO             []string `json:"FOTO"`
+}
+
+func initSQLite() *sql.DB {
+	log.Println("Iniciando base de datos SQLite...")
+	db, err := sql.Open("sqlite3", sqliteDBPath)
+	if err != nil {
+		log.Fatal("Error al abrir SQLite:", err)
+	}
+
+	createTableQuery := `
+    CREATE TABLE IF NOT EXISTS sync_status (
+        CODIGO_PRODUCTO TEXT PRIMARY KEY,
+        last_synced TIMESTAMP,
+        photo_size INTEGER
+    );`
+	_, err = db.Exec(createTableQuery)
+	if err != nil {
+		log.Fatal("Error al crear tabla de estado de sincronización:", err)
+	}
+
+	log.Println("Base de datos SQLite iniciada.")
+	return db
+}
+
+func isProductSynced(db *sql.DB, codigo string, photoSize int) bool {
+	var synced bool
+	query := "SELECT EXISTS (SELECT 1 FROM sync_status WHERE CODIGO_PRODUCTO = ? AND photo_size = ?)"
+	err := db.QueryRow(query, codigo, photoSize).Scan(&synced)
+	if err != nil {
+		log.Println("Error al verificar sincronización:", err)
+		return false
+	}
+	return synced
+}
+
+func markProductAsSynced(db *sql.DB, codigo string, photoSize int) {
+	query := "INSERT OR REPLACE INTO sync_status (CODIGO_PRODUCTO, last_synced, photo_size) VALUES (?, ?, ?)"
+	_, err := db.Exec(query, codigo, time.Now(), photoSize)
+	if err != nil {
+		log.Println("Error al marcar producto como sincronizado:", err)
+	} else {
+		log.Printf("Producto %s marcado como sincronizado con tamaño de foto %d bytes.\n", codigo, photoSize)
+	}
+}
+
+func fetchProducts(fbDB *sql.DB) ([]Product, error) {
+	log.Println("Obteniendo productos desde Firebird...")
+	rows, err := fbDB.Query("SELECT CODIGO_PRODUCTO, NOMBRE_PRODUCTO, PREVTA1_PRODUCTO, AUTOR FROM PRODUCTOS")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var products []Product
+	for rows.Next() {
+		var product Product
+		err := rows.Scan(&product.CODIGO_PRODUCTO, &product.NOMBRE_PRODUCTO, &product.PREVTA1_PRODUCTO, &product.AUTOR)
+		if err != nil {
+			return nil, err
+		}
+		products = append(products, product)
+	}
+	log.Printf("Se obtuvieron %d productos.\n", len(products))
+	return products, nil
+}
+
+func uploadAsset(filePath string) (int, error) {
+	log.Printf("Subiendo imagen para el asset desde %s...\n", filePath)
+
+	// Abre el archivo JPEG temporal que se guardó
+	file, err := os.Open(filePath)
+	if err != nil {
+		return 0, err
+	}
+	defer file.Close()
+
+	// Crea el cuerpo de la solicitud y el escritor para multipart/form-data
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+
+	// Crea el campo de archivo con el tipo MIME correcto
+	part, err := writer.CreateFormFile("file", filepath.Base(filePath))
+	if err != nil {
+		return 0, err
+	}
+
+	// Copia el contenido del archivo en el campo del archivo en la solicitud
+	_, err = io.Copy(part, file)
+	if err != nil {
+		return 0, err
+	}
+	writer.Close()
+
+	// Configura la solicitud HTTP con el tipo Content-Type adecuado
+	req, err := http.NewRequest("POST", "http://localhost:3000/products/uploadAsset", body)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		var result map[string]interface{}
+		err := json.NewDecoder(resp.Body).Decode(&result)
+		if err != nil {
+			return 0, err
+		}
+
+		// Verificamos si el ID es un número y lo convertimos a int
+		if idFloat, exists := result["id"].(float64); exists {
+			id := int(idFloat)
+			log.Printf("Asset subido exitosamente, ID: %d\n", id)
+			return id, nil
+		}
+	}
+	log.Println("Fallo al subir el asset.")
+	return 0, fmt.Errorf("failed to upload asset")
+}
+
+func fetchProductImage(fbDB *sql.DB, product Product) (string, int, error) {
+	log.Printf("Obteniendo imagen para el producto %s...\n", product.CODIGO_PRODUCTO)
+	var photo []byte
+	err := fbDB.QueryRow("SELECT FOTO FROM PRODUCTOS WHERE CODIGO_PRODUCTO = ?", product.CODIGO_PRODUCTO).Scan(&photo)
+	if err != nil {
+		return "", 0, err
+	}
+
+	if len(photo) > 0 {
+		// Crear la carpeta "temp" si no existe
+		err = os.MkdirAll("temp", os.ModePerm)
+		if err != nil {
+			log.Printf("Error al crear el directorio 'temp': %v\n", err)
+			return "", 0, err
+		}
+
+		// Guardar la imagen binaria en un archivo JPEG temporal
+		filePath := fmt.Sprintf("temp/%s.jpeg", product.CODIGO_PRODUCTO)
+		err = os.WriteFile(filePath, photo, 0644)
+		if err != nil {
+			return "", 0, err
+		}
+		log.Printf("Imagen guardada temporalmente en %s\n", filePath)
+		return filePath, len(photo), nil
+	}
+	log.Printf("No se encontró imagen para el producto %s.\n", product.CODIGO_PRODUCTO)
+	return "", 0, nil
+}
+
+func syncProduct(db *sql.DB, product Product, syncType string) {
+	jsonData, _ := json.Marshal(product)
+	url := "http://localhost:3000/products"
+	method := map[string]string{
+		"new":    "POST",
+		"delete": "DELETE",
+		"update": "PUT",
+	}[syncType]
+
+	req, err := http.NewRequest(method, url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		log.Println("Error al crear solicitud:", err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Println("Error al sincronizar producto:", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		markProductAsSynced(db, product.CODIGO_PRODUCTO, len(product.FOTO))
+		log.Printf("Producto %s sincronizado (%s).\n", product.CODIGO_PRODUCTO, syncType)
+	} else {
+		log.Printf("Error al sincronizar producto (%s): %s\n", syncType, product.CODIGO_PRODUCTO)
+	}
+}
+
+func syncProductWithPhoto(db *sql.DB, fbDB *sql.DB, product Product, syncType string) {
+	photoPath, photoSize, err := fetchProductImage(fbDB, product)
+	var assetID int
+	if err == nil && photoPath != "" {
+		if !isProductSynced(db, product.CODIGO_PRODUCTO, photoSize) {
+			assetID, err = uploadAsset(photoPath)
+			if err == nil {
+				product.FOTO = []string{fmt.Sprintf("%d", assetID)}
+				os.Remove(photoPath) // Opcional: eliminar el archivo temporal después de subir
+				markProductAsSynced(db, product.CODIGO_PRODUCTO, photoSize)
+			} else {
+				log.Printf("Error al subir el asset para el producto %s: %v", product.CODIGO_PRODUCTO, err)
+			}
+		} else {
+			log.Printf("El producto %s ya está sincronizado con la imagen actual (tamaño %d bytes).\n", product.CODIGO_PRODUCTO, photoSize)
+		}
+	} else {
+		product.FOTO = []string{}
+	}
+
+	syncProduct(db, product, syncType)
+}
+func syncProducts(fbDB *sql.DB, syncDB *sql.DB) {
+	log.Println("Iniciando sincronización de productos...")
+	products, err := fetchProducts(fbDB)
+	if err != nil {
+		log.Println("Error al obtener productos:", err)
+		return
+	}
+
+	for _, product := range products {
+		if !isProductSynced(syncDB, product.CODIGO_PRODUCTO, len(product.FOTO)) {
+			log.Printf("Sincronizando producto nuevo: %s\n", product.CODIGO_PRODUCTO)
+			syncProductWithPhoto(syncDB, fbDB, product, "new")
+		} else {
+			log.Printf("Producto %s ya sincronizado anteriormente.\n", product.CODIGO_PRODUCTO)
+		}
+	}
+	log.Println("Sincronización de productos completada.")
+}
+
+func main() {
+	log.Println("Conectando a la base de datos Firebird...")
+	fbConnStr := fmt.Sprintf("%s:%s@%s/%s?role=RDB$ADMIN", dbUser, dbPassword, dbHost, dbName)
+	fbDB, err := sql.Open("firebirdsql", fbConnStr)
+	if err != nil {
+		log.Fatal("Error al conectar a la base de datos Firebird:", err)
+	}
+	defer fbDB.Close()
+	log.Println("Conectado a la base de datos Firebird.")
+
+	syncDB := initSQLite()
+	defer syncDB.Close()
+
+	for {
+		syncProducts(fbDB, syncDB)
+		log.Println("Esperando próximo ciclo de sincronización...")
+		time.Sleep(1 * time.Hour) // Ejecuta cada hora o el intervalo que prefieras
+	}
+}
